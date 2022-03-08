@@ -1,0 +1,787 @@
+---
+title: "iPSC-microglia transcriptional response"
+author: "J Monzon Sandoval"
+date: 'Last update: `r date()`'
+output: 
+  html_document:
+    theme: journal
+    number_sections: true
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Helpers
+library(stringr)
+library(reshape)
+
+# Plots
+library(corrgram)
+library(pheatmap)
+library(ggplot2)
+library(ggExtra)
+library(cowplot)
+library(UpSetR)
+#library(ComplexHeatmap)
+
+# Standard colour palettes
+library(ggsci)
+library(RColorBrewer)
+
+# sc-RNAseq analysis
+library(Seurat)
+
+# GO enrichment analysis
+library(clusterProfiler)
+library(rrvgo)
+
+```
+
+## Gene expression data
+
++ Counts and metadata available through GEO:GSE186301.
+
+```{r}
+counts <- read.table(file = "./00_Data/GSE186301_Counts_ProteinCodingGenes.txt", 
+                     sep = "\t", header = TRUE, row.names = 1)
+metadata <- read.table("./00_Data/GSE186301_Metadata.txt", sep = "\t")
+rownames(metadata) <- str_replace(rownames(metadata), "-", ".")
+
+# Set levels for experimental groups
+metadata$Group <- factor(x = metadata$Group, 
+                         levels = c("Control", "ATPgS_24h", "LPSIFNg_24h", 
+                                    "LPSIFNg_48h", "LPSIFNg_48h_ATPgS_24h",
+                                    "PGE2_24h", "PGE2_48h", "PGE2_48h_ATPgS_24h"))
+
+# Filtering to genes that are expressed in at least 100 cellls (12335 genes across 20231 cells)
+ipsc <- CreateSeuratObject(counts = counts, 
+                           meta.data = metadata,
+                           project = "iPSCmicro", 
+                           min.cells = 100)
+
+rm(counts, metadata)
+
+```
+
+## QC summary
+
+```{r fig.height=3.5, fig.width=10}
+
+d2p <- ipsc@meta.data
+
+g1  <- ggplot(data = d2p, mapping = aes(x = nFeature_RNA)) + 
+  geom_histogram(bins = 25) + 
+  theme(aspect.ratio = 1) + 
+  geom_text(label = paste("Median = ", median(d2p$nFeature_RNA), sep = ""), 
+            y = 3000, 
+            x = quantile(x = d2p$nFeature_RNA, probs = .9))
+
+g2  <- ggplot(data = d2p, mapping = aes(x = nCount_RNA)) + 
+  geom_histogram(bins = 25) + 
+  theme(aspect.ratio = 1) + 
+  geom_text(label = paste("Median = ", median(d2p$nCount_RNA), sep = ""), 
+            y = 6000, 
+            x = quantile(x = d2p$nCount_RNA, probs = .9))
+
+g3  <- ggplot(data = d2p, mapping = aes(x = percent.mito)) + 
+  geom_histogram(bins = 25) + 
+  theme(aspect.ratio = 1) + 
+  geom_text(label = paste("Median = ", signif(median(d2p$percent.mito), 4), sep = ""), 
+            y = 6000, 
+            x = quantile(x = d2p$percent.mito, probs = .9))
+
+pdf("./100_Figures/QC_summary.pdf", height = 3, width = 7)
+plot_grid(g1, g2, g3, ncol = 3)
+dev.off()
+
+rm(d2p, g1, g2, g3)
+
+```
+
+## Data normalization, dimensionality reduction and clustering
+
+```{r}
+
+ipsc <- NormalizeData(object = ipsc,
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 1e4, 
+                      verbose = TRUE)
+
+ipsc <- FindVariableFeatures(object = ipsc, nfeatures = 1000)
+
+ipsc <- ScaleData(object = ipsc, verbose = TRUE)
+ipsc <- RunPCA(object = ipsc, verbose = TRUE)
+ipsc <- JackStraw(object = ipsc, verbose = TRUE)
+ipsc <- ScoreJackStraw(object = ipsc, reduction = "pca", dims = 1:20)
+
+#JackStrawPlot(ipsc)
+#ElbowPlot(ipsc, ndims = 50)
+
+ipsc <- RunTSNE(object = ipsc, verbose = TRUE, reduction = "pca", dims = 1:20)
+ipsc <- RunUMAP(object = ipsc, verbose = TRUE, reduction = "pca", dims = 1:20)
+
+ipsc <- FindNeighbors(object = ipsc, dims = 1:20)
+ipsc <- FindClusters(object = ipsc, resolution = 0.1)
+
+```
+
+### UMAP (all cells)
+
+```{r fig.height=3.5, fig.width=4}
+
+# Version with UMAP
+
+F1a <- DimPlot(object = ipsc, group.by = "Group", reduction = "umap") + scale_colour_igv() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 2)) + 
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+
+F1b <- DimPlot(object = ipsc, group.by = "donor", reduction = "umap") + scale_colour_futurama() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 2)) + 
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+F1a
+F1b
+
+rm(F1a, F1b)
+
+```
+
+## Cell clustering
+
+```{r}
+
+# Supplementary Figure 1
+
+donor_group <- paste(sapply(str_split(ipsc$donor, "-"), "[", 1), ipsc$Group, sep = "-")
+ipsc <- AddMetaData(object = ipsc, metadata = donor_group, col.name = "Donor_Group")
+
+d2p <- table(ipsc@meta.data[, c("Donor_Group", "seurat_clusters")])
+
+ranot <- data.frame(Donor = sapply(str_split(rownames(d2p), "-"), "[", 1), 
+                    Group = sapply(str_split(rownames(d2p), "-"), "[", 2), 
+                    row.names = rownames(d2p))
+canot <- data.frame(Cluster = colnames(d2p), row.names = colnames(d2p))
+
+anot_col <- list(Donor = c("SFC180" = pal_futurama()(4)[1],
+                           "SFC841" = pal_futurama()(4)[2],
+                           "SFC854"= pal_futurama()(4)[3],
+                           "SFC856" = pal_futurama()(4)[4]),
+                 Group = c("Control" = pal_igv()(8)[1],
+                           "ATPgS_24h" = pal_igv()(8)[2],
+                           "LPSIFNg_24h" = pal_igv()(8)[3],  
+                           "LPSIFNg_48h" = pal_igv()(8)[4], 
+                           "LPSIFNg_48h_ATPgS_24h" = pal_igv()(8)[5], 
+                           "PGE2_24h" = pal_igv()(8)[6],  
+                           "PGE2_48h" = pal_igv()(8)[7], 
+                           "PGE2_48h_ATPgS_24h" = pal_igv()(8)[8]),
+                 Cluster = c("0" = pal_d3()(8)[1],
+                             "1" = pal_d3()(8)[2], 
+                             "2" = pal_d3()(8)[3], 
+                             "3" = pal_d3()(8)[4],
+                             "4" = pal_d3()(8)[5],
+                             "5" = pal_d3()(8)[6],
+                             "6" = pal_d3()(8)[7],
+                             "7" = pal_d3()(8)[8]))
+
+SF1b <- DimPlot(object = ipsc, group.by = "seurat_clusters", reduction = "umap") + scale_colour_d3() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8))  + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 3)) + 
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+
+SF1c <- pheatmap(d2p,
+                 color = colorRampPalette(brewer.pal(n = 7, name = "Blues"))(100),
+                 cellwidth = 15, 
+                 cellheight = 8, 
+                 cluster_cols = FALSE, 
+                 display_numbers = TRUE, 
+                 number_format = "%.0f",
+                 number_color = "black", 
+                 border_color = NA, 
+                 treeheight_row = 15, 
+                 fontsize_row = 6,
+                 annotation_col = canot, 
+                 annotation_row = ranot, 
+                 annotation_colors = anot_col,
+                 silent = TRUE, 
+                 fontsize_number = 6, 
+                 legend = TRUE)
+
+rm(donor_group, anot_col, canot, ranot)
+
+```
+
+```{r fig.height=6, fig.width=7}
+# Supplementary Figure 1
+
+pdf("./100_Figures/SupplementaryFigure_1bc.pdf", width = 7, height = 6)
+plot_grid(SF1b, SF1c$gtable, ncol = 2, rel_widths = c(2, 3), labels = c("B", "C"))
+dev.off()
+
+rm(d2p, SF1b, SF1c)
+
+```
+
+## Identification of cell populations
+
+```{r}
+
+# Microglia markers
+
+microglia_markers <- read.table("./00_Data/Microglia_CoreSignature_2018_Patir.txt", sep = "\t")
+microglia_markers <- microglia_markers$V1[microglia_markers$V1 %in% rownames(ipsc)]
+
+bks <- seq(1, length(microglia_markers), length(microglia_markers) / 3)
+
+SF2a <- FeaturePlot(object = ipsc, features = "C1QB", cols = c("grey", "red"), pt.size = .1) + 
+  theme(aspect.ratio = 1, legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6)) +  
+  xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+SF2b <- FeaturePlot(object = ipsc, features = "COL1A1", cols = c("grey", "red"), pt.size = .1) + 
+  theme(aspect.ratio = 1, legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6)) +  
+  xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+SF2c <- FeaturePlot(object = ipsc, features = "TOP2A", cols = c("grey", "red"), pt.size = .1) + 
+  theme(aspect.ratio = 1, legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6)) +  
+  xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+SF2d <- DotPlot(object = ipsc, features = microglia_markers[(bks[2]- 1):bks[1]], cols = c("grey", "red")) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6))
+
+SF2e <- DotPlot(object = ipsc, features = microglia_markers[(bks[3]- 1):bks[2]], cols = c("grey", "red")) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6))
+
+SF2f <- DotPlot(object = ipsc, features = microglia_markers[(length(microglia_markers)):bks[3]], cols = c("grey", "red")) +
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6))
+
+```
+
+
+```{r, fig.width=6.7, fig.height=10.5}
+
+# Supplementary Figure 2
+
+SF2top <- plot_grid(SF2a, SF2b, SF2c, ncol = 3, labels = c("A", "B", "C"))
+SF2bot <- plot_grid(SF2d, SF2e, SF2f, ncol = 3, labels = c("D", "", ""))
+
+pdf("./100_Figures/SupplementaryFigure_2.pdf", width = 6.7, height = 10)
+plot_grid(SF2top, SF2bot, ncol = 1, rel_heights = c(1, 3))
+dev.off()
+
+rm(microglia_markers, bks, SF2a, SF2b, SF2c, SF2d, SF2e, SF2f, SF2top, SF2bot)
+
+```
+
+### Markers of cluster 6) and cycling microglia (cluster 7)
+
++ Fibroblast like (cluster 6)
+
++ Proliferative/cycling microglia (cluster 7)
+
+```{r}
+
+# Supplementary Figure 3
+DEA_clusters <- FindAllMarkers(object = ipsc)
+
+# Marker 
+top20_c6_markers <- head(DEA_clusters[which(DEA_clusters$cluster == 6), "gene"], 20)
+
+SF3a <- DotPlot(object = ipsc, features = rev(top20_c6_markers), cols = c("grey", "red")) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6))
+
+# top markers for cluster 5 replicating
+top20_c7_markers <- head(DEA_clusters[which(DEA_clusters$cluster == 7), "gene"], 20)
+
+SF3b <- DotPlot(object = ipsc, features = rev(top20_c7_markers), cols = c("grey", "red")) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "horizontal", 
+        legend.title = element_blank(), legend.text = element_text(size = 6),
+        legend.key.height = unit(2, "mm"), legend.key.width = unit(4, "mm"),
+        legend.box = "vertical", axis.text = element_text(size = 6))
+```
+
+```{r}
+pdf("./100_Figures/SupplementaryFigure_3.pdf", width = 7, height = 4)
+plot_grid(SF3a, SF3b, labels = c("A", "B"))
+dev.off()
+
+# Object with Gene Markers per cluster 
+saveRDS(object = ipsc, file = "./00_Data/iPSC.Rds")
+saveRDS(object = DEA_clusters, file = "./00_Data/DEA_clusters.Rds")
+
+rm(DEA_clusters, top20_c6_markers, top20_c7_markers, SF3a, SF3b)
+
+```
+
+## iPSC-microglia
+
+```{r}
+
+# Keep only iPSC-microglia like cells
+ipsc_micro <- subset(x = ipsc, idents = c(0, 1, 2, 3, 4, 5))
+
+ipsc_micro <- NormalizeData(object = ipsc_micro,
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 1e4, 
+                      verbose = TRUE)
+
+ipsc_micro <- FindVariableFeatures(object = ipsc_micro, nfeatures = 1000)
+
+
+ipsc_micro <- ScaleData(object = ipsc_micro, verbose = TRUE)
+ipsc_micro <- RunPCA(object = ipsc_micro, verbose = TRUE)
+ipsc_micro <- RunTSNE(object = ipsc_micro, verbose = TRUE, reduction = "pca", dims = 1:30)
+ipsc_micro <- RunUMAP(object = ipsc_micro, verbose = TRUE, reduction = "pca", dims = 1:30)
+
+# Object with 19448 cells (removing fibroblast like and proliferative microglia)
+saveRDS(object = ipsc_micro, file = "./00_Data/iPSC_Microglia.Rds")
+
+```
+
+## iPSC-microglia (control cells only)
+
+```{r}
+# iPSC-microglia of controls only
+ipsc_micro_ctrl <- ipsc_micro
+Idents(ipsc_micro_ctrl) <- ipsc_micro_ctrl$Group
+
+ipsc_micro_ctrl <- subset(ipsc_micro_ctrl, idents = "Control")
+ipsc_micro_ctrl <- NormalizeData(object = ipsc_micro_ctrl,
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 1e4, 
+                      verbose = TRUE)
+
+ipsc_micro_ctrl <- FindVariableFeatures(object = ipsc_micro_ctrl, nfeatures = 1000)
+
+ipsc_micro_ctrl <- ScaleData(object = ipsc_micro_ctrl, verbose = TRUE)
+ipsc_micro_ctrl <- RunPCA(object = ipsc_micro_ctrl, verbose = TRUE)
+ipsc_micro_ctrl <- RunTSNE(object = ipsc_micro_ctrl, verbose = TRUE, reduction = "pca", dims = 1:30)
+ipsc_micro_ctrl <- RunUMAP(object = ipsc_micro_ctrl, verbose = TRUE, reduction = "pca", dims = 1:30)
+
+ipsc_micro_ctrl <- FindNeighbors(object = ipsc_micro_ctrl, dims = 1:30)
+ipsc_micro_ctrl <- FindClusters(object = ipsc_micro_ctrl, resolution = .1)
+
+saveRDS(object = ipsc_micro_ctrl, file = "./00_Data/iPSC_Microglia_Control.Rds")
+
+```
+
+```{r}
+
+# Supplementary Figure 4
+
+# A) UMAP by donor
+
+SF4a <- DimPlot(object = ipsc_micro_ctrl, group.by = "donor", reduction = "umap", pt.size = .1) + 
+  scale_colour_futurama() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 1)) + 
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+# B) UMAP clustering using just control cells
+
+d2p <- table(ipsc_micro_ctrl@meta.data[, c("donor", "seurat_clusters")])
+
+ranot <- data.frame(Donor = sapply(str_split(rownames(d2p), "-"), "[", 1), 
+                    row.names = rownames(d2p))
+canot <- data.frame(Cluster = colnames(d2p), 
+                    row.names = colnames(d2p))
+
+anot_col <- list(Donor = c("SFC180" = pal_futurama()(4)[1],
+                           "SFC841" = pal_futurama()(4)[2],
+                           "SFC854"= pal_futurama()(4)[3],
+                           "SFC856" = pal_futurama()(4)[4]),
+                 Cluster = c("0" = pal_d3(palette = "category20b")(4)[1],
+                             "1" = pal_d3(palette = "category20b")(4)[2], 
+                             "2" = pal_d3(palette = "category20b")(4)[3], 
+                             "3" = pal_d3(palette = "category20b")(4)[4]))
+
+SF4b <- DimPlot(object = ipsc_micro_ctrl, group.by = "seurat_clusters", reduction = "umap", pt.size = .1) + 
+  scale_colour_d3(palette = "category20b") + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 1)) + 
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+# Cell clustering  based on control cells only
+
+SF4c <- pheatmap(d2p,
+                 color = colorRampPalette(brewer.pal(n = 7, name = "Blues"))(100),
+                 cellwidth = 15, 
+                 cellheight = 8, 
+                 cluster_cols = FALSE, 
+                 display_numbers = TRUE, 
+                 number_format = "%.0f",
+                 number_color = "black", 
+                 border_color = NA, 
+                 treeheight_row = 15, 
+                 fontsize_row = 6,
+                 annotation_col = canot, 
+                 annotation_row = ranot, 
+                 annotation_colors = anot_col,
+                 silent = TRUE, 
+                 fontsize_number = 6, 
+                 legend = TRUE)
+
+rm(anot_col, canot, ranot)
+
+```
+
+```{r}
+
+pdf("./100_Figures/SupplementaryFigure_4.pdf", width = 7, height = 4)
+plot_grid(SF4a, SF4b, SF4c$gtable, 
+          ncol = 3, labels = c("A", "B", "C"), 
+          align = "h", axis = "bt")
+dev.off()
+
+rm(SF4a, SF4b, SF4c, ipsc_micro_ctrl)
+rm(d2p)
+
+```
+
+## iPSC-microglia (all experimental group)
+
+```{r}
+#  Figure 1. Overview of iPSC microglia
+
+F1a <- DimPlot(object = ipsc_micro, group.by = "Group", reduction = "umap") + scale_colour_igv() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 2)) +
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+F1b <- DimPlot(object = ipsc_micro, group.by = "donor", reduction = "umap") + scale_colour_futurama() + 
+  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 1)) +
+  ggtitle(label = "") + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+F1c <- DimPlot(ipsc_micro, group.by = "Group", reduction = "pca") + scale_color_igv()  + 
+  theme(aspect.ratio = 1, legend.position = "bottom", 
+        legend.direction = "horizontal", axis.text = element_text(size = 8)) + 
+  guides(colour = guide_legend(override.aes = list(size = 3, shape = 16), ncol = 2)) + 
+  ggtitle(label = "") + 
+  xlab(label = paste("PC1 (", paste(signif(ipsc_micro@reductions$pca@stdev[1], 3), "%)", sep = ""))) +
+  ylab(label = paste("PC2 (", paste(signif(ipsc_micro@reductions$pca@stdev[2], 3), "%)", sep = "")))
+
+F1c <- ggMarginal(F1c, type = "density", groupColour = TRUE, groupFill =  TRUE, 
+                  margins = "both", xparams = list(size = .1), yparams = list(size = .1))
+
+```
+
+
+```{r}
+
+# Differential expression analysis
+Idents(ipsc_micro) <- ipsc_micro$Group
+
+DEA_ATPgS24h <- FindMarkers(object = ipsc_micro, ident.1 = "ATPgS_24h", ident.2 = "Control", test.use = "wilcox")
+DEA_LPSIFNg24h <- FindMarkers(object = ipsc_micro, ident.1 = "LPSIFNg_24h", ident.2 = "Control", test.use = "wilcox")
+DEA_LPSIFNg48h <- FindMarkers(object = ipsc_micro, ident.1 = "LPSIFNg_48h", ident.2 = "Control", test.use = "wilcox")
+DEA_LPSIFNg48hATPgS24h <- FindMarkers(object = ipsc_micro, ident.1 = "LPSIFNg_48h_ATPgS_24h", ident.2 = "Control", test.use = "wilcox")
+DEA_PGE224h <- FindMarkers(object = ipsc_micro, ident.1 = "PGE2_24h", ident.2 = "Control", test.use = "wilcox")
+DEA_PGE248h <- FindMarkers(object = ipsc_micro, ident.1 = "PGE2_48h", ident.2 = "Control", test.use = "wilcox")
+DEA_PGE248hATPgS24h <- FindMarkers(object = ipsc_micro, ident.1 = "PGE2_48h_ATPgS_24h", ident.2 = "Control", test.use = "wilcox")
+
+# keep genes with adjusted p < 0.05
+th <- 0.05
+
+DEA_ATPgS24h <- DEA_ATPgS24h[which(DEA_ATPgS24h$p_val_adj < th), ]
+DEA_LPSIFNg24h <- DEA_LPSIFNg24h[which(DEA_LPSIFNg24h$p_val_adj < th), ]
+DEA_LPSIFNg48h <- DEA_LPSIFNg48h[which(DEA_LPSIFNg48h$p_val_adj < th), ]
+DEA_LPSIFNg48hATPgS24h <- DEA_LPSIFNg48hATPgS24h[which(DEA_LPSIFNg48hATPgS24h$p_val_adj < th), ]
+DEA_PGE224h <- DEA_PGE224h[which(DEA_PGE224h$p_val_adj < th), ]
+DEA_PGE248h <- DEA_PGE248h[which(DEA_PGE248h$p_val_adj < th), ]
+DEA_PGE248hATPgS24h <- DEA_PGE248hATPgS24h[which(DEA_PGE248hATPgS24h$p_val_adj < th), ]
+
+# DEG genes 
+DEA <- ls(pattern = "DEA")
+DEAn <- str_replace(string = DEA, pattern = "DEA_", replacement = "")
+
+ndegs <- matrix(NA, nrow = length(DEA), ncol = 2, dimnames = list(DEAn, c("DOWN", "UP")))
+
+for (i in c(1:length(DEA))){
+  cat(length(which(get(DEA[i])[, "avg_log2FC"] > 0)), "\n")
+  ndegs[i, ] <- table(get(DEA[i])[, "avg_log2FC"] > 0)
+}
+rm(i)
+
+
+# Number DEGs
+d2p <- data.frame(reshape2::melt(ndegs))
+colnames(d2p) <- c("Comparison", "Type", "DEGs")
+
+F1d <- ggplot(data = d2p, mapping = aes(x = Comparison, y = DEGs, fill = Type)) + 
+  geom_col() + scale_fill_aaas(alpha = .5) + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(size = 10, angle = 315, vjust = 0.5, hjust = 0)) + 
+  geom_text(aes(label = DEGs), position = position_stack()) + 
+  ylab(label = "Number of genes") 
+
+rm(th)
+
+```
+
+```{r}
+
+# Differential expression Wilcoxon test
+saveRDS(object = DEA_ATPgS24h, "./00_Data/DEA_wilcox_ATPgS24h.Rds")
+saveRDS(object = DEA_LPSIFNg24h, "./00_Data/DEA_wilcox_LPSIFNg24h.Rds")
+saveRDS(object = DEA_LPSIFNg48h, "./00_Data/DEA_wilcox_LPSIFNg48h.Rds")
+saveRDS(object = DEA_LPSIFNg48hATPgS24h, "./00_Data/DEA_wilcox_LPSIFNg48hATPgS24h.Rds")
+saveRDS(object = DEA_PGE224h, "./00_Data/DEA_wilcox_PGE224h.Rds")
+saveRDS(object = DEA_PGE248h, "./00_Data/DEA_wilcox_PGE248h.Rds")
+saveRDS(object = DEA_PGE248hATPgS24h, "./00_Data/DEA_wilcox_PGE248hATPgS24h.Rds")
+
+```
+
+
+```{r fig.height=7, fig.width=7}
+
+# Figure 1
+
+pdf(file = "./100_Figures/Figure_1.pdf", width = 7, height = 8)
+plot_grid(F1a, F1b, F1c, F1d, 
+          ncol = 2, align = "hv", axis = "rlbt", 
+          labels = c("A", "B", "C", "D"))
+dev.off()
+
+rm(F1a, F1b, F1c, F1d)
+
+```
+
+
+```{r}
+# DEG list 
+
+DEG_24h <- list(`ATPgS 24h` = rownames(DEA_ATPgS24h),
+                `LPSI+FNg 24h`  = rownames(DEA_LPSIFNg24h),
+                `PGE2 24h` = rownames(DEA_PGE224h))
+
+F2a <- venn::venn(DEG_24h, zcolor = pal_igv()(8)[c(2, 3, 6)], 
+                  opacity = .5, ggplot = TRUE, box = FALSE, col = "white")
+
+DEG_LPSIFNg <- list(`LPSI+FNg 24h`  = rownames(DEA_LPSIFNg24h),
+                    `LPSI+FNg 48h` = rownames(DEA_LPSIFNg48h))
+
+F2b <- venn::venn(DEG_LPSIFNg, zcolor = pal_igv()(8)[c(3, 4)], 
+                  opacity = .5, ggplot = TRUE, box = FALSE, col = "white")
+
+DEG_PGE2 <- list(`PGE2 24h`  = rownames(DEA_PGE224h),
+                 `PGE2 48h` = rownames(DEA_PGE248h))
+
+F2c <- venn::venn(DEG_PGE2, zcolor = pal_igv()(8)[c(6, 7)], 
+                  opacity = .5, ggplot = TRUE, box = FALSE, col = "white")
+
+F2top <- plot_grid(F2a, F2b, F2c, ncol = 3, labels = c("A", "C", "D"))
+
+rm(DEG_24h, DEG_LPSIFNg, DEG_PGE2)
+
+```
+
+```{r}
+# Gene lists for differential expression analysis separated by UP and DOWN regulated genes
+
+DEGs_list_type <- list(ATPgS24h_UP = rownames(DEA_ATPgS24h)[which(DEA_ATPgS24h$avg_log2FC > 0)],
+                       LPSIFNg24h_UP = rownames(DEA_LPSIFNg24h)[which(DEA_LPSIFNg24h$avg_log2FC > 0)],
+                       LPSIFNg48h_UP = rownames(DEA_LPSIFNg48h)[which(DEA_LPSIFNg48h$avg_log2FC > 0)],
+                       LPSIFNg48hATPgS24h_UP = rownames(DEA_LPSIFNg48hATPgS24h)[which(DEA_LPSIFNg48hATPgS24h$avg_log2FC > 0)],
+                       PGE224h_UP = rownames(DEA_PGE224h)[which(DEA_PGE224h$avg_log2FC > 0)],
+                       PGE248h_UP = rownames(DEA_PGE248h)[which(DEA_PGE248h$avg_log2FC > 0)],
+                       PGE248hATPgS24h_UP = rownames(DEA_PGE248hATPgS24h)[which(DEA_PGE248hATPgS24h$avg_log2FC > 0)],
+                       ATPgS24h_DOWN = rownames(DEA_ATPgS24h)[which(DEA_ATPgS24h$avg_log2FC < 0)],
+                       LPSIFNg24h_DOWN = rownames(DEA_LPSIFNg24h)[which(DEA_LPSIFNg24h$avg_log2FC < 0)],
+                       LPSIFNg48h_DOWN = rownames(DEA_LPSIFNg48h)[which(DEA_LPSIFNg48h$avg_log2FC < 0)],
+                       LPSIFNg48hATPgS24h_DOWN = rownames(DEA_LPSIFNg48hATPgS24h)[which(DEA_LPSIFNg48hATPgS24h$avg_log2FC < 0)],
+                       PGE224h_DOWN = rownames(DEA_PGE224h)[which(DEA_PGE224h$avg_log2FC < 0)],
+                       PGE248h_DOWN = rownames(DEA_PGE248h)[which(DEA_PGE248h$avg_log2FC < 0)],
+                       PGE248hATPgS24h_DOWN = rownames(DEA_PGE248hATPgS24h)[which(DEA_PGE248hATPgS24h$avg_log2FC < 0)])
+
+```
+
+
+```{r}
+
+## Gene Ontology enrichment analysis
+
+# Background population
+bg <- rownames(ipsc_micro)
+
+# Gene Ontology Analysis
+branch <- c("BP", "CC", "MF")
+
+for(j in c(1:length(branch))){
+  for(i in c(1:length(DEGs_list_type))){
+    genei <- DEGs_list_type[[i]]
+    goi <- enrichGO(gene = genei, 
+                    OrgDb = "org.Hs.eg.db",  
+                    keyType = "SYMBOL",  
+                    ont = branch[j],
+                    pAdjustMethod = "fdr",
+                    qvalueCutoff = 0.05,
+                    universe = bg)
+
+    write.table(goi@result, file = paste("./00_Data/GO_", branch[j] ,"_DEA_wilcox_", names(DEGs_list_type)[i], ".csv", sep = ""), 
+                sep = ",", quote = TRUE, row.names = FALSE)
+    rm(goi, genei)
+  }
+}
+
+rm(i, j, branch)
+
+```
+
+
+```{r}
+
+# GO summary for biological processes
+fn <- list.files(path = "./00_Data/", pattern = "^GO_BP", full.names = TRUE)
+fns <- sapply(str_split(sapply(str_split(string = fn, pattern = "_DEA_wilcox_"), "[", 2), ".csv"), "[", 1)
+
+# All GO enriched GO terms with an adjusted p value < 0.05
+adjPt <- 0.05
+gos <- vector()
+for(i in c(1:length(fn))){
+  ti <- read.table(fn[i], sep = ",", header = TRUE)
+  gos <- unique(c(gos, ti$ID[which(ti$p.adjust < adjPt)]))
+}
+rm(i, ti)
+
+# Get a matrix with all log transformed adjusted p values 
+# keep the largest log transformed / smallest adjusted p value to reduce GO terms
+ltp <- matrix(NA, nrow = length(gos), ncol = length(fn), 
+              dimnames = list(gos, fns))
+# Also create a matrix with Gene Annotations
+ganot <- matrix(NA, nrow = length(gos), ncol = length(fn), 
+              dimnames = list(gos, fns))
+  
+for(i in c(1:length(fn))){
+  ti <- read.table(fn[i], sep = ",", header = TRUE)
+  ltp[, i] <- -log10(ti$p.adjust[match(x = gos, table = ti$ID)])
+  ganot[, i] <- ti$geneID[match(x = gos, table = ti$ID)]
+}
+max_ltp <- apply(X = ltp, MARGIN = 1, FUN = function(x) max(x, na.rm = TRUE))
+
+# Similarity matrix for all enriched GO terms
+sm <- calculateSimMatrix(gos,
+                         orgdb = "org.Hs.eg.db",
+                         ont = "BP",
+                         method = "Rel")
+
+# Save Genes annotated to each enriched GO term
+saveRDS(object = ganot, file = "./00_Data/Genes_EnrichedGO_DEA_wilcox.Rds")
+
+```
+
+```{r}
+# Reduce scores based on the lowest p value found across comparisons
+redterms <- reduceSimMatrix(simMatrix = sm, 
+                            scores = max_ltp,
+                            threshold = 0.85,
+                            orgdb = "org.Hs.eg.db")
+
+# Create a matrix based on the smallest adjusted p value per GO term reduced group
+pp <- unique(redterms$parent)
+mm <- matrix(data = NA, nrow = length(pp), ncol = length(fn),
+             dimnames = list(pp, fns))
+
+for(i in c(1:length(pp))){
+  ppi <- pp[i] # parent term
+  cti <- redterms$go[which(redterms$parent == ppi)] # child terms
+  if(length(cti) == 1){
+    mm[i, ] <- ltp[cti, ]
+    if(length(which(is.na(mm[i, ]) == TRUE) > 0)){
+      mm[i, which(is.na(mm[i, ]) == TRUE)] <- 0
+    }
+
+  } else {
+    mm[i, ] <- apply(X = ltp[cti, ], 
+                     MARGIN = 2,
+                     FUN = function(x) {
+                       if(sum(is.na(x)) == length(cti))
+                       x <- 0 else (x <- max(x, na.rm = TRUE))
+                     }
+                   )  
+  }
+}
+
+# Change GO IDs to term description for plot
+mfh <- mm
+rownames(mfh) <- redterms$parentTerm[match(rownames(mm), table = redterms$parent)]
+
+
+# Annotation colours
+canot <- data.frame(Type = sapply(str_split(fns, "_"), "[", 2),
+                    Group = sapply(str_split(fns, "_"), "[", 1), 
+                    row.names = fns)
+
+anot_col <- list(Type = c("UP" = pal_aaas()(2)[2], 
+                          "DOWN" = pal_aaas()(2)[1]),
+                 Group = c("ATPgS24h" = pal_igv()(8)[2],
+                           "LPSIFNg24h" = pal_igv()(8)[3],  
+                           "LPSIFNg48h" = pal_igv()(8)[4], 
+                           "LPSIFNg48hATPgS24h" = pal_igv()(8)[5], 
+                           "PGE224h" = pal_igv()(8)[6],  
+                           "PGE248h" = pal_igv()(8)[7], 
+                           "PGE248hATPgS24h" = pal_igv()(8)[8]))
+
+
+```
+
+```{r fig.height=6.5, fig.width=8}
+
+F2d <- pheatmap(mat = mfh, breaks = c(0, seq(-log10(0.05), max(mfh), length = 99)),
+                color = c("darkgrey", 
+                          colorRampPalette(brewer.pal(n = 9, name = "RdPu")[3:9])(99)), 
+                labels_row = str_trunc(string = rownames(mfh), width = 50, ellipsis = "..."),
+                cellwidth = 10,
+                scale = "none", fontsize_row = 8, fontsize_col = 7,
+                treeheight_row = 15, treeheight_col = 15, cluster_rows = FALSE,
+                #clustering_distance_rows = dist(1-sm[pp, pp]),
+                border_color = "white", angle_col = 315, cutree_cols = 2, 
+                annotation_col = canot, annotation_colors = anot_col, silent = TRUE)
+
+```
+
+
+```{r}
+# Figure 2 
+
+pdf("./100_Figures/Figure_2.pdf", width = 7.5, height = 8.5)
+plot_grid(F2top, F2d$gtable, ncol = 1, 
+          labels = c("", "D"), 
+          rel_heights = c(1, 4.4))
+dev.off()
+
+```
+
