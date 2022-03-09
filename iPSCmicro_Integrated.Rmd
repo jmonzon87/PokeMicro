@@ -1,0 +1,213 @@
+---
+title: "iPSC-microglia transcriptional response"
+author: "J Monzon Sandoval"
+date: 'Last update: `r date()`'
+output: 
+  html_document:
+    theme: journal
+    number_sections: true
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(SeuratData)
+library(patchwork)
+library(ggplot2)
+library(ggsci)
+
+```
+
+## Integration by donors
+
+```{r}
+
+# Load dataset (only iPSC microglia)
+ipsc_micro <- readRDS(file = "./00_Data/iPSC_Microglia.Rds")
+
+# Split the dataset into a list of 4 seurat objects (one per donor)
+ipscmicro_list <- SplitObject(ipsc_micro, split.by = "donor")
+
+# normalize and identify variable features for each dataset independently
+ipscmicro_list <- lapply(X = ipscmicro_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 1000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = ipscmicro_list) # 1620
+
+# Gene expression data has been integrated following by donor. 
+# Top 1000 most variable features per donor, from which 1620 were repeatedly variable across donors. 
+# Integration was donr by finding anchors and running cannonical correlation analysis between  all pairwise anchors.
+#
+rm(ipsc_micro)
+
+```
+
+```{r}
+
+ipscmicro_anchors <- FindIntegrationAnchors(object.list = ipscmicro_list, anchor.features = features)
+
+# this command creates an 'integrated' data assay
+ipscmicro_combined <- IntegrateData(anchorset = ipscmicro_anchors)
+
+# specify that we will perform downstream analysis on the corrected data note that the
+# original unmodified data still resides in the 'RNA' assay
+DefaultAssay(ipscmicro_combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+ipscmicro_combined <- ScaleData(ipscmicro_combined, verbose = FALSE)
+ipscmicro_combined <- RunPCA(ipscmicro_combined, npcs = 30, verbose = FALSE)
+ipscmicro_combined <- RunUMAP(ipscmicro_combined, reduction = "pca", dims = 1:30)
+ipscmicro_combined <- FindNeighbors(ipscmicro_combined, reduction = "pca", dims = 1:30)
+#ipscmicro_combined <- FindClusters(ipscmicro_combined, resolution = 0.5)
+
+```
+
+
+```{r}
+# Integrated dataset split by donor coloured by Group
+
+ipscmicro_combined@meta.data$Group <- factor(x = ipscmicro_combined@meta.data$Group, 
+                                             levels = c("Control", "ATPgS_24h", "LPSIFNg_24h", "LPSIFNg_48h", "LPSIFNg_48h_ATPgS_24h", "PGE2_24h", "PGE2_48h", "PGE2_48h_ATPgS_24h"))
+
+SF5 <- DimPlot(object = ipscmicro_combined, group.by = "Group", split.by = "donor", ncol = 2)
+SF5 <- SF5 + theme(aspect.ratio = 1) + scale_color_igv() + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+pdf("./100_Figures/SupplementaryFigure_5.pdf", width = 7, height = 5)
+SF5
+dev.off()
+
+#PF <- DimPlot(object = ipscmicro_combined, group.by = "Group", ncol = 2)
+#PF <- PF + theme(aspect.ratio = 1) + scale_color_igv() + xlab(label = "UMAP 1") + ylab(label = "UMAP 2")
+
+#pdf("./100_Figures/PotentialFigure.pdf", width = 7, height = 3.5)
+#PF
+#dev.off()
+
+
+```
+
+
+```{r}
+
+# For performing differential expression after integration, 
+# Switch back to the original data
+
+DefaultAssay(ipscmicro_combined) <- "RNA"
+
+# Conserved markers per experimental group
+Idents(ipscmicro_combined) <- ipscmicro_combined$Group
+  
+DEA_ATPgS24h <- FindConservedMarkers(ipscmicro_combined, 
+                                     ident.1 = "ATPgS_24h", 
+                                     ident.2 = "Control",
+                                     grouping.var = "donor", 
+                                     verbose = TRUE)
+
+DEA_LPSIFNg24h <- FindConservedMarkers(ipscmicro_combined, 
+                                       ident.1 = "LPSIFNg_24h", 
+                                       ident.2 = "Control",
+                                       grouping.var = "donor",
+                                       verbose = TRUE)
+
+DEA_LPSIFNg48h <- FindConservedMarkers(ipscmicro_combined, 
+                                       ident.1 = "LPSIFNg_48h", 
+                                       ident.2 = "Control",
+                                       grouping.var = "donor", 
+                                       verbose = TRUE)
+
+DEA_LPSIFNg48hATPgS24h <- FindConservedMarkers(ipscmicro_combined, 
+                                               ident.1 = "LPSIFNg_48h_ATPgS_24h", 
+                                               ident.2 = "Control",
+                                               grouping.var = "donor", 
+                                               verbose = TRUE)
+
+DEA_PGE224h <- FindConservedMarkers(ipscmicro_combined, 
+                                    ident.1 = "PGE2_24h", 
+                                    ident.2 = "Control",
+                                    grouping.var = "donor",
+                                    verbose = TRUE)
+
+DEA_PGE248h <- FindConservedMarkers(ipscmicro_combined, 
+                                    ident.1 = "PGE2_48h", 
+                                    ident.2 = "Control",
+                                    grouping.var = "donor", 
+                                    verbose = TRUE)
+
+DEA_PGE248hATPgS24h <- FindConservedMarkers(ipscmicro_combined, 
+                                            ident.1 = "PGE2_48h_ATPgS_24h", 
+                                            ident.2 = "Control",
+                                            grouping.var = "donor", 
+                                            verbose = TRUE)
+
+# Difference reference for comparison through time
+DEA_LPSIFNg48h_LPSIFNg24h <- FindConservedMarkers(ipscmicro_combined, 
+                                                  ident.1 = "LPSIFNg_48h",
+                                                  ident.2 = "LPSIFNg_24h",
+                                                  grouping.var = "donor",
+                                                  verbose = TRUE)
+
+DEA_PGE248h_PGE224h <- FindConservedMarkers(ipscmicro_combined,
+                                            ident.1 = "PGE2_48h",
+                                            ident.2 = "PGE2_24h",
+                                            grouping.var = "donor",
+                                            verbose = TRUE)
+
+# Controlling for ATPgS the combined effects
+DEA_LPSIFNg48hATPgS24h_ATPgS24h <- FindConservedMarkers(ipscmicro_combined, 
+                                                      ident.1 = "LPSIFNg_48h_ATPgS_24h",
+                                                      ident.2 = "ATPgS_24h",
+                                                      grouping.var = "donor",
+                                                      verbose = TRUE)
+
+DEA_PGE248hATPgS24h_ATPgS24h <- FindConservedMarkers(ipscmicro_combined, 
+                                                      ident.1 = "PGE2_48h_ATPgS_24h",
+                                                      ident.2 = "ATPgS_24h",
+                                                      grouping.var = "donor",
+                                                      verbose = TRUE)
+
+# Controlling for treatment the in the ATPgS combined effects
+DEA_LPSIFNg48hATPgS24h_LPSIFNg48h <- FindConservedMarkers(ipscmicro_combined, 
+                                                      ident.1 = "LPSIFNg_48h_ATPgS_24h",
+                                                      ident.2 = "LPSIFNg_48h",
+                                                      grouping.var = "donor",
+                                                      verbose = TRUE)
+
+DEA_PGE248hATPgS24h_PGE248h <- FindConservedMarkers(ipscmicro_combined, 
+                                                      ident.1 = "PGE2_48h_ATPgS_24h",
+                                                      ident.2 = "PGE2_48h",
+                                                      grouping.var = "donor",
+                                                      verbose = TRUE)
+
+# Comparisons against control
+saveRDS(object = DEA_ATPgS24h, "./00_Data/DEA_conserved_ATPgS24h.Rds")
+saveRDS(object = DEA_LPSIFNg24h, "./00_Data/DEA_conserved_LPSIFNg24h.Rds")
+saveRDS(object = DEA_LPSIFNg48h, "./00_Data/DEA_conserved_LPSIFNg48h.Rds")
+saveRDS(object = DEA_LPSIFNg48hATPgS24h, "./00_Data/DEA_conserved_LPSIFNg48hATPgS24h.Rds")
+saveRDS(object = DEA_PGE224h, "./00_Data/DEA_conserved_PGE224h.Rds")
+saveRDS(object = DEA_PGE248h, "./00_Data/DEA_conserved_PGE248h.Rds")
+saveRDS(object = DEA_PGE248hATPgS24h, "./00_Data/DEA_conserved_PGE248hATPgS24h.Rds")
+
+# Comparisons between time points
+saveRDS(object = DEA_LPSIFNg48h_LPSIFNg24h, "./00_Data/DEA_conserved_LPSIFNg48h_LPSIFNg24h.Rds")
+saveRDS(object = DEA_PGE248h_PGE224h, "./00_Data/DEA_conserved_PGE248h_PGE224h.Rds")
+
+# Comparisons to ATPgS 
+saveRDS(object = DEA_LPSIFNg48hATPgS24h_ATPgS24h, "./00_Data/DEA_conserved_LPSIFNg48hATPgS24h_ATPgS24h.Rds")
+saveRDS(object = DEA_PGE248hATPgS24h_ATPgS24h, "./00_Data/DEA_conserved_PGE248hATPgS24h_ATPgS24h.Rds")
+saveRDS(object = DEA_LPSIFNg48hATPgS24h_LPSIFNg48h, "./00_Data/DEA_conserved_LPSIFNg48hATPgS24h_LPSIFNg48h.Rds")
+saveRDS(object = DEA_PGE248hATPgS24h_PGE248h, "./00_Data/DEA_conserved_PGE248hATPgS24h_PGE248h.Rds")
+
+# Save integrated object
+saveRDS(object = ipscmicro_combined, file = "./00_Data/iPSC_Microglia_integrated.Rds")
+
+```
+
