@@ -8,4 +8,4 @@ Code for the analysis of single cell RNA-seq data from induced Pluripotent Stem 
 
 ## License
 
-Distributed under the gpl-3.0 License. See `LICENSE.txt` for more information.
+Distributed under the MIT License. See `LICENSE.txt` for more information.
